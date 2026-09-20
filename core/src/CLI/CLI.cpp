@@ -528,7 +528,7 @@ namespace draconis::cli {
       Print(R"bash(
 _draconis++_completions() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local opts="-V --verbose -d --doctor -l --log-level --clear-cache --lang --ignore-cache --no-ascii --format --compact --logo-path --logo-protocol --logo-width --logo-height --version --help --benchmark --config-path --generate-completions --list-plugins --plugin-info"
+    local opts="-V --verbose -d --doctor -l --log-level --clear-cache --lang --ignore-cache --no-ascii --width --format --compact --logo-path --logo-protocol --logo-width --logo-height --version --help --benchmark --config-path --generate-completions --list-plugins --plugin-info"
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=($(compgen -W "$opts" -- "$cur"))
@@ -568,6 +568,7 @@ _draconis++() {
         '--lang[Set language]:language:(en es fr de)'
         '--ignore-cache[Ignore cache for this run]'
         '--no-ascii[Disable ASCII art]'
+        '--width[Lay out for this terminal width (0 disables adaptation)]'
         '--format[Output format]'
         '--compact[Single-line output with template]'
         '--logo-path[Path to logo image]:file:_files'
@@ -597,6 +598,7 @@ complete -c draconis++ -l clear-cache -d 'Clears the cache'
 complete -c draconis++ -l lang -x -a 'en es fr de' -d 'Set language'
 complete -c draconis++ -l ignore-cache -d 'Ignore cache for this run'
 complete -c draconis++ -l no-ascii -d 'Disable ASCII art'
+complete -c draconis++ -l width -x -d 'Lay out for this terminal width (0 disables adaptation)'
 complete -c draconis++ -l format -x -d 'Output format'
 complete -c draconis++ -l compact -d 'Single-line output with template'
 complete -c draconis++ -l logo-path -r -d 'Path to logo image'
@@ -628,6 +630,7 @@ Register-ArgumentCompleter -CommandName draconis++ -ScriptBlock {
         @{ Name = '--lang'; Tooltip = 'Set language' }
         @{ Name = '--ignore-cache'; Tooltip = 'Ignore cache for this run' }
         @{ Name = '--no-ascii'; Tooltip = 'Disable ASCII art' }
+        @{ Name = '--width'; Tooltip = 'Lay out for this terminal width (0 disables adaptation)' }
         @{ Name = '--format'; Tooltip = 'Output format' }
         @{ Name = '--compact'; Tooltip = 'Single-line output with template' }
         @{ Name = '--logo-path'; Tooltip = 'Path to logo image' }

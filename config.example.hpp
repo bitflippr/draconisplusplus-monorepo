@@ -50,6 +50,14 @@ namespace draconis::config {
    */
   inline constexpr PrecompiledLogo DRAC_LOGO = {};
 
+  /**
+   * @brief Whether the layout adapts to the size of the terminal.
+   * @details The output narrows, wraps, and drops the logo to fit the terminal
+   * it is printed into. Uncomment the line below to always render at the
+   * natural width instead. A `config.hpp` that leaves this undefined adapts.
+   */
+  // #define DRAC_UI_RESPONSIVE false
+
   #if DRAC_ENABLE_PACKAGECOUNT
   /**
    * @brief Configures which package managers' counts are displayed.

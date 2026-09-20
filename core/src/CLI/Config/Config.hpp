@@ -127,6 +127,7 @@ namespace draconis::config {
    */
   struct UI {
     draconis::utils::types::Vec<UILayoutGroup> layout;
+    bool                                       responsive = true; ///< Adapt the layout to the size of the terminal.
   };
 
 #if DRAC_ENABLE_PLUGINS

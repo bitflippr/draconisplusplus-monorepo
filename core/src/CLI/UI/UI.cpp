@@ -3,15 +3,19 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#ifndef _WIN32
+#ifdef _WIN32
+  #include <windows.h> // GetConsoleScreenBufferInfo, GetStdHandle
+#else
   #include <sys/ioctl.h> // TIOCGWINSZ
   #include <unistd.h>    // STDOUT_FILENO
 #endif
 
+#include <Drac++/Utils/Env.hpp>
 #include <Drac++/Utils/Localization.hpp>
 #include <Drac++/Utils/Logging.hpp>
 #include <Drac++/Utils/Types.hpp>
@@ -116,7 +120,417 @@ namespace draconis::ui {
 
   constexpr inline Icons ICON_TYPE = NERD;
 
+  /**
+   * @brief Text measurement and fitting helpers.
+   *
+   * These decide how much room a string needs and how to make it fit, which
+   * is what the responsive layout is built on. Exposed so the layout rules can
+   * be tested directly.
+   */
+  namespace detail {
+    namespace {
+      auto IsWideCharacter(char32_t codepoint) -> bool {
+        return (codepoint >= 0x1100 && codepoint <= 0x115F) || // Hangul Jamo
+          (codepoint >= 0x2329 && codepoint <= 0x232A) ||      // Angle brackets
+          (codepoint >= 0x2E80 && codepoint <= 0x2EFF) ||      // CJK Radicals Supplement
+          (codepoint >= 0x2F00 && codepoint <= 0x2FDF) ||      // Kangxi Radicals
+          (codepoint >= 0x2FF0 && codepoint <= 0x2FFF) ||      // Ideographic Description Characters
+          (codepoint >= 0x3000 && codepoint <= 0x303E) ||      // CJK Symbols and Punctuation
+          (codepoint >= 0x3041 && codepoint <= 0x3096) ||      // Hiragana
+          (codepoint >= 0x3099 && codepoint <= 0x30FF) ||      // Katakana
+          (codepoint >= 0x3105 && codepoint <= 0x312F) ||      // Bopomofo
+          (codepoint >= 0x3131 && codepoint <= 0x318E) ||      // Hangul Compatibility Jamo
+          (codepoint >= 0x3190 && codepoint <= 0x31BF) ||      // Kanbun
+          (codepoint >= 0x31C0 && codepoint <= 0x31EF) ||      // CJK Strokes
+          (codepoint >= 0x31F0 && codepoint <= 0x31FF) ||      // Katakana Phonetic Extensions
+          (codepoint >= 0x3200 && codepoint <= 0x32FF) ||      // Enclosed CJK Letters and Months
+          (codepoint >= 0x3300 && codepoint <= 0x33FF) ||      // CJK Compatibility
+          (codepoint >= 0x3400 && codepoint <= 0x4DBF) ||      // CJK Unified Ideographs Extension A
+          (codepoint >= 0x4E00 && codepoint <= 0x9FFF) ||      // CJK Unified Ideographs
+          (codepoint >= 0xA000 && codepoint <= 0xA48F) ||      // Yi Syllables
+          (codepoint >= 0xA490 && codepoint <= 0xA4CF) ||      // Yi Radicals
+          (codepoint >= 0xAC00 && codepoint <= 0xD7A3) ||      // Hangul Syllables
+          (codepoint >= 0xF900 && codepoint <= 0xFAFF) ||      // CJK Compatibility Ideographs
+          (codepoint >= 0xFE10 && codepoint <= 0xFE19) ||      // Vertical Forms
+          (codepoint >= 0xFE30 && codepoint <= 0xFE6F) ||      // CJK Compatibility Forms
+          (codepoint >= 0xFF00 && codepoint <= 0xFF60) ||      // Fullwidth Forms
+          (codepoint >= 0xFFE0 && codepoint <= 0xFFE6) ||      // Fullwidth Forms
+          (codepoint >= 0x20000 && codepoint <= 0x2FFFD) ||    // CJK Unified Ideographs Extension B, C, D, E
+          (codepoint >= 0x30000 && codepoint <= 0x3FFFD);      // CJK Unified Ideographs Extension F
+      }
+
+      auto DecodeUTF8(const StringView& str, usize& pos) -> char32_t {
+        if (pos >= str.length())
+          return 0;
+
+        const auto getByte = [&](usize index) -> u8 {
+          return static_cast<u8>(str.at(index));
+        };
+
+        const u8 first = getByte(pos++);
+
+        if ((first & 0x80) == 0) // ASCII (0xxxxxxx)
+          return first;
+
+        if ((first & 0xE0) == 0xC0) {
+          // 2-byte sequence (110xxxxx 10xxxxxx)
+          if (pos >= str.length())
+            return 0;
+
+          const u8 second = getByte(pos++);
+
+          return ((first & 0x1F) << 6) | (second & 0x3F);
+        }
+
+        if ((first & 0xF0) == 0xE0) {
+          // 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx)
+          if (pos + 1 >= str.length())
+            return 0;
+
+          const u8 second = getByte(pos++);
+          const u8 third  = getByte(pos++);
+
+          return ((first & 0x0F) << 12) | ((second & 0x3F) << 6) | (third & 0x3F);
+        }
+
+        if ((first & 0xF8) == 0xF0) {
+          // 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
+          if (pos + 2 >= str.length())
+            return 0;
+
+          const u8 second = getByte(pos++);
+          const u8 third  = getByte(pos++);
+          const u8 fourth = getByte(pos++);
+
+          return ((first & 0x07) << 18) | ((second & 0x3F) << 12) | ((third & 0x3F) << 6) | (fourth & 0x3F);
+        }
+
+        return 0; // Invalid UTF-8
+      }
+    } // namespace
+
+    auto GetVisualWidth(const StringView& str) -> usize {
+      usize width    = 0;
+      bool  inEscape = false;
+      usize pos      = 0;
+
+      while (pos < str.length()) {
+        const char current = str.at(pos);
+
+        if (inEscape) {
+          if (current == 'm' || current == '\\' || current == '\a')
+            inEscape = false;
+
+          pos++;
+        } else if (current == '\033') {
+          inEscape = true;
+          pos++;
+        } else {
+          const char32_t codepoint = DecodeUTF8(str, pos);
+          if (codepoint != 0)
+            width += IsWideCharacter(codepoint) ? 2 : 1;
+        }
+      }
+
+      return width;
+    }
+
+    /**
+     * @brief Cuts a string down to a visual width, marking the loss with an ellipsis.
+     * @param str Text to shorten; embedded ANSI escapes are copied through untouched.
+     * @param maxWidth Visual width the result must not exceed.
+     * @return The original string when it already fits, otherwise a shortened copy.
+     */
+    auto TruncateToWidth(const StringView& str, const usize maxWidth) -> String {
+      if (maxWidth == 0)
+        return "";
+
+      if (GetVisualWidth(str) <= maxWidth)
+        return String(str);
+
+      const usize budget = maxWidth - 1; // Leave a column for the ellipsis.
+
+      String out;
+      usize  width     = 0;
+      usize  pos       = 0;
+      bool   inEscape  = false;
+      bool   sawEscape = false;
+
+      while (pos < str.length()) {
+        const usize start   = pos;
+        const char  current = str.at(pos);
+
+        if (inEscape) {
+          if (current == 'm' || current == '\\' || current == '\a')
+            inEscape = false;
+
+          pos++;
+          out.append(str.substr(start, pos - start));
+          continue;
+        }
+
+        if (current == '\033') {
+          inEscape  = true;
+          sawEscape = true;
+          pos++;
+          out.append(str.substr(start, pos - start));
+          continue;
+        }
+
+        const char32_t codepoint = DecodeUTF8(str, pos);
+
+        if (codepoint == 0)
+          break;
+
+        const usize charWidth = IsWideCharacter(codepoint) ? 2 : 1;
+
+        if (width + charWidth > budget)
+          break;
+
+        width += charWidth;
+        out.append(str.substr(start, pos - start));
+      }
+
+      out.append("…");
+
+      // A cut inside styled text can drop the terminating reset.
+      if (sawEscape)
+        out.append("\033[0m");
+
+      return out;
+    }
+
+    namespace {
+      /**
+       * @brief Splits a single over-long token into chunks of at most maxWidth.
+       * @param word Token with no internal whitespace.
+       * @param maxWidth Visual width each chunk must fit into.
+       */
+      auto HardBreakWord(const StringView& word, const usize maxWidth) -> Vec<String> {
+        Vec<String> chunks;
+
+        if (maxWidth == 0) {
+          chunks.emplace_back(word);
+          return chunks;
+        }
+
+        String current;
+        usize  currentWidth = 0;
+        usize  pos          = 0;
+
+        while (pos < word.length()) {
+          const usize    start     = pos;
+          const char32_t codepoint = DecodeUTF8(word, pos);
+
+          if (codepoint == 0)
+            break;
+
+          const usize charWidth = IsWideCharacter(codepoint) ? 2 : 1;
+
+          if (currentWidth > 0 && currentWidth + charWidth > maxWidth) {
+            chunks.push_back(std::move(current));
+            current.clear();
+            currentWidth = 0;
+          }
+
+          current.append(word.substr(start, pos - start));
+          currentWidth += charWidth;
+        }
+
+        if (!current.empty())
+          chunks.push_back(std::move(current));
+
+        return chunks;
+      }
+    } // namespace
+
+    /**
+     * @brief Word-wrap text to a specified visual width with balanced line lengths
+     * @param text The text to wrap
+     * @param wrapWidth Maximum visual width per line (0 = no wrap)
+     * @return Vector of wrapped lines
+     */
+    auto WordWrap(const StringView& text, const usize wrapWidth) -> Vec<String> {
+      Vec<String> lines;
+
+      if (wrapWidth == 0) {
+        lines.emplace_back(text);
+        return lines;
+      }
+
+      // Split into non-owning words so wrapping does not allocate per token.
+      Vec<StringView> words;
+      Vec<usize>      wordWidths;
+
+      // Backs the pieces of any token too long to fit on a line by itself. A
+      // deque is used because push_back must not invalidate the views above.
+      std::deque<String> brokenWords;
+
+      for (usize pos = 0; pos < text.size();) {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text.at(pos))) != 0)
+          ++pos;
+
+        const usize wordStart = pos;
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text.at(pos))) == 0)
+          ++pos;
+
+        if (pos > wordStart) {
+          const StringView word  = text.substr(wordStart, pos - wordStart);
+          const usize      width = GetVisualWidth(word);
+
+          // A token wider than the line can never fit; break it up so it is
+          // wrapped instead of spilling past the border.
+          if (width > wrapWidth) {
+            for (String& chunk : HardBreakWord(word, wrapWidth)) {
+              brokenWords.push_back(std::move(chunk));
+              words.emplace_back(brokenWords.back());
+              wordWidths.push_back(GetVisualWidth(brokenWords.back()));
+            }
+
+            continue;
+          }
+
+          words.push_back(word);
+          wordWidths.push_back(width);
+        }
+      }
+
+      if (words.empty())
+        return lines;
+
+      // Prefix sums make every candidate line-width query constant-time.
+      Vec<usize> prefixWidth(words.size() + 1, 0);
+      for (usize idx = 0; idx < words.size(); ++idx)
+        prefixWidth.at(idx + 1) = prefixWidth.at(idx) + wordWidths.at(idx);
+
+      // Helper to get width of words[start..end) with spaces
+      auto getLineWidth = [&](usize start, usize end) -> usize {
+        if (start >= end)
+          return 0;
+        return prefixWidth.at(end) - prefixWidth.at(start) + end - start - 1;
+      };
+
+      // Do greedy wrap first to determine minimum number of lines needed
+      Vec<usize> greedyBreaks; // indices where lines start
+      greedyBreaks.push_back(0);
+      usize currentWidth = 0;
+      for (usize idx = 0; idx < words.size(); ++idx) {
+        const usize addedWidth = wordWidths.at(idx) + (currentWidth > 0 ? 1 : 0);
+        if (currentWidth > 0 && currentWidth + addedWidth > wrapWidth) {
+          greedyBreaks.push_back(idx);
+          currentWidth = wordWidths.at(idx);
+        } else {
+          currentWidth += addedWidth;
+        }
+      }
+
+      const usize numLines = greedyBreaks.size();
+
+      // If only one line, return as-is
+      if (numLines == 1) {
+        String line;
+        for (usize idx = 0; idx < words.size(); ++idx) {
+          if (idx > 0)
+            line += " ";
+          line += words.at(idx);
+        }
+        lines.push_back(line);
+        return lines;
+      }
+
+      // For balanced wrapping, find optimal break points
+      // Use dynamic programming to find breaks that minimize max line length difference
+      // For simplicity with 2 lines, just find the break that makes lines most equal
+      if (numLines == 2) {
+        usize bestBreak = 1;
+        usize bestDiff  = std::numeric_limits<usize>::max();
+
+        for (usize breakPoint = 1; breakPoint < words.size(); ++breakPoint) {
+          const usize firstWidth  = getLineWidth(0, breakPoint);
+          const usize secondWidth = getLineWidth(breakPoint, words.size());
+
+          // Both lines must fit within wrapWidth
+          if (firstWidth > wrapWidth || secondWidth > wrapWidth)
+            continue;
+
+          const usize diff = firstWidth > secondWidth ? firstWidth - secondWidth : secondWidth - firstWidth;
+          if (diff < bestDiff) {
+            bestDiff  = diff;
+            bestBreak = breakPoint;
+          }
+        }
+
+        // Build lines from best break
+        String line1, line2;
+        for (usize idx = 0; idx < bestBreak; ++idx) {
+          if (idx > 0)
+            line1 += " ";
+          line1 += words.at(idx);
+        }
+        for (usize idx = bestBreak; idx < words.size(); ++idx) {
+          if (idx > bestBreak)
+            line2 += " ";
+          line2 += words.at(idx);
+        }
+        lines.push_back(line1);
+        lines.push_back(line2);
+        return lines;
+      }
+
+      // For 3+ lines, use a generalized approach: aim for equal distribution
+      const usize totalWidth  = getLineWidth(0, words.size());
+      const usize targetWidth = (totalWidth + numLines - 1) / numLines;
+
+      lines.clear();
+      String currentLine;
+      currentWidth    = 0;
+      usize linesLeft = numLines;
+
+      for (usize idx = 0; idx < words.size(); ++idx) {
+        const usize widthIfAdded        = currentWidth + wordWidths.at(idx) + (currentWidth > 0 ? 1 : 0);
+        const usize remainingWidth      = getLineWidth(idx, words.size());
+        const usize avgRemainingPerLine = linesLeft > 0 ? (remainingWidth + linesLeft - 1) / linesLeft : 0;
+
+        // Break if: exceeds max, or current line is at target and remaining fits well in remaining lines
+        const bool shouldBreak = !currentLine.empty() &&
+          (widthIfAdded > wrapWidth ||
+           (currentWidth >= targetWidth && linesLeft > 1 && remainingWidth >= avgRemainingPerLine));
+
+        if (shouldBreak) {
+          lines.push_back(currentLine);
+          currentLine.clear();
+          currentWidth = 0;
+          linesLeft--;
+        }
+
+        if (!currentLine.empty()) {
+          currentLine += " ";
+          currentWidth += 1;
+        }
+        currentLine += words.at(idx);
+        currentWidth += wordWidths.at(idx);
+      }
+
+      if (!currentLine.empty())
+        lines.push_back(currentLine);
+
+      return lines;
+    }
+  } // namespace detail
+
+  using namespace detail;
+
   namespace {
+    // Borders and the trailing gutter consume three columns beyond the content.
+    constexpr usize BOX_CHROME_WIDTH = 3;
+
+    // Columns between the logo and the box when they are drawn side by side.
+    constexpr usize LOGO_GUTTER_WIDTH = 2;
+
+    // A row needs at least this much room for its value before the box is
+    // considered too cramped to be worth drawing.
+    constexpr usize MIN_VALUE_WIDTH = 8;
+
     struct RowInfo {
       String   icon;
       String   label;
@@ -136,6 +550,7 @@ namespace draconis::ui {
       Vec<bool>     autoWraps;
       Vec<LogColor> valueColors;
       usize         maxLabelWidth = 0;
+      usize         maxIconWidth  = 0;
     };
 
     struct LogoRender {
@@ -285,6 +700,88 @@ namespace draconis::ui {
       usize width  = 0;
       usize height = 0;
     };
+
+    struct TerminalSize {
+      usize columns = 0;
+      usize rows    = 0;
+    };
+
+    /**
+     * @brief Asks the operating system how large the terminal on stdout is.
+     * @return None when stdout is redirected rather than attached to a terminal.
+     */
+    auto QueryTerminalSize() -> Option<TerminalSize> {
+#ifdef _WIN32
+      const HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE); // NOLINT(misc-misplaced-const) - HANDLE is a typedef to void*
+
+      if (handle == nullptr || handle == INVALID_HANDLE_VALUE)
+        return None;
+
+      CONSOLE_SCREEN_BUFFER_INFO info {};
+
+      if (GetConsoleScreenBufferInfo(handle, &info) == 0)
+        return None;
+
+      const i32 columns = info.srWindow.Right - info.srWindow.Left + 1;
+      const i32 rows    = info.srWindow.Bottom - info.srWindow.Top + 1;
+
+      if (columns > 0 && rows > 0)
+        return TerminalSize { .columns = static_cast<usize>(columns), .rows = static_cast<usize>(rows) };
+#else
+      winsize size {};
+
+      if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0 && size.ws_row > 0)
+        return TerminalSize { .columns = static_cast<usize>(size.ws_col), .rows = static_cast<usize>(size.ws_row) };
+#endif
+      return None;
+    }
+
+    // Reads a positive integer from an environment variable, if it holds one.
+    auto ReadEnvDimension(PCStr name) -> Option<usize> {
+      const Result<String> raw = draconis::utils::env::GetEnv(name);
+
+      if (!raw || raw->empty())
+        return None;
+
+      usize value = 0;
+
+      for (const char chr : *raw) {
+        if (std::isdigit(static_cast<unsigned char>(chr)) == 0)
+          return None;
+
+        value = (value * 10) + static_cast<usize>(chr - '0');
+      }
+
+      return value > 0 ? Option<usize>(value) : None;
+    }
+
+    /**
+     * @brief Resolves the column budget the rendered block must fit into.
+     * @param widthOverride Explicit width from the caller, if any.
+     * @return The usable column count, or 0 when the width is unconstrained.
+     *
+     * An explicit override wins, then COLUMNS/LINES from the environment, then
+     * the terminal itself. When nothing answers (output redirected to a file,
+     * for example) the layout is left unconstrained so piped output keeps its
+     * historical shape.
+     */
+    auto ResolveTerminalSize(const Option<usize>& widthOverride) -> TerminalSize {
+      TerminalSize resolved;
+
+      if (const Option<TerminalSize> queried = QueryTerminalSize())
+        resolved = *queried;
+
+      if (const Option<usize> columns = ReadEnvDimension("COLUMNS"))
+        resolved.columns = *columns;
+
+      if (const Option<usize> rows = ReadEnvDimension("LINES"))
+        resolved.rows = *rows;
+
+      if (widthOverride)
+        resolved.columns = *widthOverride;
+
+      return resolved;
+    }
 
     // Query terminal cell pixel dimensions (stdout). Returns None if unavailable.
     auto GetCellMetricsPx() -> Option<Pair<double, double>> {
@@ -670,277 +1167,50 @@ namespace draconis::ui {
       "\033[38;5;15m◯\033[0m"
     };
 
-    constexpr auto IsWideCharacter(char32_t codepoint) -> bool {
-      return (codepoint >= 0x1100 && codepoint <= 0x115F) || // Hangul Jamo
-        (codepoint >= 0x2329 && codepoint <= 0x232A) ||      // Angle brackets
-        (codepoint >= 0x2E80 && codepoint <= 0x2EFF) ||      // CJK Radicals Supplement
-        (codepoint >= 0x2F00 && codepoint <= 0x2FDF) ||      // Kangxi Radicals
-        (codepoint >= 0x2FF0 && codepoint <= 0x2FFF) ||      // Ideographic Description Characters
-        (codepoint >= 0x3000 && codepoint <= 0x303E) ||      // CJK Symbols and Punctuation
-        (codepoint >= 0x3041 && codepoint <= 0x3096) ||      // Hiragana
-        (codepoint >= 0x3099 && codepoint <= 0x30FF) ||      // Katakana
-        (codepoint >= 0x3105 && codepoint <= 0x312F) ||      // Bopomofo
-        (codepoint >= 0x3131 && codepoint <= 0x318E) ||      // Hangul Compatibility Jamo
-        (codepoint >= 0x3190 && codepoint <= 0x31BF) ||      // Kanbun
-        (codepoint >= 0x31C0 && codepoint <= 0x31EF) ||      // CJK Strokes
-        (codepoint >= 0x31F0 && codepoint <= 0x31FF) ||      // Katakana Phonetic Extensions
-        (codepoint >= 0x3200 && codepoint <= 0x32FF) ||      // Enclosed CJK Letters and Months
-        (codepoint >= 0x3300 && codepoint <= 0x33FF) ||      // CJK Compatibility
-        (codepoint >= 0x3400 && codepoint <= 0x4DBF) ||      // CJK Unified Ideographs Extension A
-        (codepoint >= 0x4E00 && codepoint <= 0x9FFF) ||      // CJK Unified Ideographs
-        (codepoint >= 0xA000 && codepoint <= 0xA48F) ||      // Yi Syllables
-        (codepoint >= 0xA490 && codepoint <= 0xA4CF) ||      // Yi Radicals
-        (codepoint >= 0xAC00 && codepoint <= 0xD7A3) ||      // Hangul Syllables
-        (codepoint >= 0xF900 && codepoint <= 0xFAFF) ||      // CJK Compatibility Ideographs
-        (codepoint >= 0xFE10 && codepoint <= 0xFE19) ||      // Vertical Forms
-        (codepoint >= 0xFE30 && codepoint <= 0xFE6F) ||      // CJK Compatibility Forms
-        (codepoint >= 0xFF00 && codepoint <= 0xFF60) ||      // Fullwidth Forms
-        (codepoint >= 0xFFE0 && codepoint <= 0xFFE6) ||      // Fullwidth Forms
-        (codepoint >= 0x20000 && codepoint <= 0x2FFFD) ||    // CJK Unified Ideographs Extension B, C, D, E
-        (codepoint >= 0x30000 && codepoint <= 0x3FFFD);      // CJK Unified Ideographs Extension F
-    }
-
-    constexpr auto DecodeUTF8(const StringView& str, usize& pos) -> char32_t {
-      if (pos >= str.length())
+    // Number of swatches the palette row can show in the given width, sampling
+    // evenly across the 16 colors so a narrow box still spans the whole range.
+    constexpr auto FittingCircleCount(usize availableWidth) -> usize {
+      if (COLOR_CIRCLES.empty())
         return 0;
 
-      const auto getByte = [&](usize index) -> u8 {
-        return static_cast<u8>(str.at(index));
-      };
+      const usize circleWidth = GetVisualWidth(COLOR_CIRCLES.at(0));
 
-      const u8 first = getByte(pos++);
+      if (circleWidth == 0 || availableWidth < circleWidth)
+        return 0;
 
-      if ((first & 0x80) == 0) // ASCII (0xxxxxxx)
-        return first;
-
-      if ((first & 0xE0) == 0xC0) {
-        // 2-byte sequence (110xxxxx 10xxxxxx)
-        if (pos >= str.length())
-          return 0;
-
-        const u8 second = getByte(pos++);
-
-        return ((first & 0x1F) << 6) | (second & 0x3F);
-      }
-
-      if ((first & 0xF0) == 0xE0) {
-        // 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx)
-        if (pos + 1 >= str.length())
-          return 0;
-
-        const u8 second = getByte(pos++);
-        const u8 third  = getByte(pos++);
-
-        return ((first & 0x0F) << 12) | ((second & 0x3F) << 6) | (third & 0x3F);
-      }
-
-      if ((first & 0xF8) == 0xF0) {
-        // 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
-        if (pos + 2 >= str.length())
-          return 0;
-
-        const u8 second = getByte(pos++);
-        const u8 third  = getByte(pos++);
-        const u8 fourth = getByte(pos++);
-
-        return ((first & 0x07) << 18) | ((second & 0x3F) << 12) | ((third & 0x3F) << 6) | (fourth & 0x3F);
-      }
-
-      return 0; // Invalid UTF-8
-    }
-
-    constexpr auto GetVisualWidth(const StringView& str) -> usize {
-      usize width    = 0;
-      bool  inEscape = false;
-      usize pos      = 0;
-
-      while (pos < str.length()) {
-        const char current = str.at(pos);
-
-        if (inEscape) {
-          if (current == 'm' || current == '\\' || current == '\a')
-            inEscape = false;
-
-          pos++;
-        } else if (current == '\033') {
-          inEscape = true;
-          pos++;
-        } else {
-          const char32_t codepoint = DecodeUTF8(str, pos);
-          if (codepoint != 0)
-            width += IsWideCharacter(codepoint) ? 2 : 1;
-        }
-      }
-
-      return width;
-    }
-
-    /**
-     * @brief Word-wrap text to a specified visual width with balanced line lengths
-     * @param text The text to wrap
-     * @param wrapWidth Maximum visual width per line (0 = no wrap)
-     * @return Vector of wrapped lines
-     */
-    auto WordWrap(const StringView& text, const usize wrapWidth) -> Vec<String> {
-      Vec<String> lines;
-
-      if (wrapWidth == 0) {
-        lines.emplace_back(text);
-        return lines;
-      }
-
-      // Split into non-owning words so wrapping does not allocate per token.
-      Vec<StringView> words;
-      Vec<usize>      wordWidths;
-      for (usize pos = 0; pos < text.size();) {
-        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text.at(pos))) != 0)
-          ++pos;
-
-        const usize wordStart = pos;
-        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text.at(pos))) == 0)
-          ++pos;
-
-        if (pos > wordStart) {
-          const StringView word = text.substr(wordStart, pos - wordStart);
-          words.push_back(word);
-          wordWidths.push_back(GetVisualWidth(word));
-        }
-      }
-
-      if (words.empty())
-        return lines;
-
-      // Prefix sums make every candidate line-width query constant-time.
-      Vec<usize> prefixWidth(words.size() + 1, 0);
-      for (usize idx = 0; idx < words.size(); ++idx)
-        prefixWidth.at(idx + 1) = prefixWidth.at(idx) + wordWidths.at(idx);
-
-      // Helper to get width of words[start..end) with spaces
-      auto getLineWidth = [&](usize start, usize end) -> usize {
-        if (start >= end)
-          return 0;
-        return prefixWidth.at(end) - prefixWidth.at(start) + end - start - 1;
-      };
-
-      // Do greedy wrap first to determine minimum number of lines needed
-      Vec<usize> greedyBreaks; // indices where lines start
-      greedyBreaks.push_back(0);
-      usize currentWidth = 0;
-      for (usize idx = 0; idx < words.size(); ++idx) {
-        const usize addedWidth = wordWidths.at(idx) + (currentWidth > 0 ? 1 : 0);
-        if (currentWidth > 0 && currentWidth + addedWidth > wrapWidth) {
-          greedyBreaks.push_back(idx);
-          currentWidth = wordWidths.at(idx);
-        } else {
-          currentWidth += addedWidth;
-        }
-      }
-
-      const usize numLines = greedyBreaks.size();
-
-      // If only one line, return as-is
-      if (numLines == 1) {
-        String line;
-        for (usize idx = 0; idx < words.size(); ++idx) {
-          if (idx > 0)
-            line += " ";
-          line += words.at(idx);
-        }
-        lines.push_back(line);
-        return lines;
-      }
-
-      // For balanced wrapping, find optimal break points
-      // Use dynamic programming to find breaks that minimize max line length difference
-      // For simplicity with 2 lines, just find the break that makes lines most equal
-      if (numLines == 2) {
-        usize bestBreak = 1;
-        usize bestDiff  = std::numeric_limits<usize>::max();
-
-        for (usize breakPoint = 1; breakPoint < words.size(); ++breakPoint) {
-          const usize firstWidth  = getLineWidth(0, breakPoint);
-          const usize secondWidth = getLineWidth(breakPoint, words.size());
-
-          // Both lines must fit within wrapWidth
-          if (firstWidth > wrapWidth || secondWidth > wrapWidth)
-            continue;
-
-          const usize diff = firstWidth > secondWidth ? firstWidth - secondWidth : secondWidth - firstWidth;
-          if (diff < bestDiff) {
-            bestDiff  = diff;
-            bestBreak = breakPoint;
-          }
-        }
-
-        // Build lines from best break
-        String line1, line2;
-        for (usize idx = 0; idx < bestBreak; ++idx) {
-          if (idx > 0)
-            line1 += " ";
-          line1 += words.at(idx);
-        }
-        for (usize idx = bestBreak; idx < words.size(); ++idx) {
-          if (idx > bestBreak)
-            line2 += " ";
-          line2 += words.at(idx);
-        }
-        lines.push_back(line1);
-        lines.push_back(line2);
-        return lines;
-      }
-
-      // For 3+ lines, use a generalized approach: aim for equal distribution
-      const usize totalWidth  = getLineWidth(0, words.size());
-      const usize targetWidth = (totalWidth + numLines - 1) / numLines;
-
-      lines.clear();
-      String currentLine;
-      currentWidth    = 0;
-      usize linesLeft = numLines;
-
-      for (usize idx = 0; idx < words.size(); ++idx) {
-        const usize widthIfAdded        = currentWidth + wordWidths.at(idx) + (currentWidth > 0 ? 1 : 0);
-        const usize remainingWidth      = getLineWidth(idx, words.size());
-        const usize avgRemainingPerLine = linesLeft > 0 ? (remainingWidth + linesLeft - 1) / linesLeft : 0;
-
-        // Break if: exceeds max, or current line is at target and remaining fits well in remaining lines
-        const bool shouldBreak = !currentLine.empty() &&
-          (widthIfAdded > wrapWidth ||
-           (currentWidth >= targetWidth && linesLeft > 1 && remainingWidth >= avgRemainingPerLine));
-
-        if (shouldBreak) {
-          lines.push_back(currentLine);
-          currentLine.clear();
-          currentWidth = 0;
-          linesLeft--;
-        }
-
-        if (!currentLine.empty()) {
-          currentLine += " ";
-          currentWidth += 1;
-        }
-        currentLine += words.at(idx);
-        currentWidth += wordWidths.at(idx);
-      }
-
-      if (!currentLine.empty())
-        lines.push_back(currentLine);
-
-      return lines;
+      return std::min(COLOR_CIRCLES.size(), availableWidth / circleWidth);
     }
 
     constexpr auto CreateDistributedColorCircles(usize availableWidth) -> String {
       if (COLOR_CIRCLES.empty() || availableWidth == 0)
         return "";
 
+      const usize numCircles = FittingCircleCount(availableWidth);
+
+      if (numCircles == 0)
+        return "";
+
+      // Evenly sampled indices, so a reduced palette still starts at the first
+      // color and ends at the last.
+      const auto circleAt = [numCircles](usize index) -> StringView {
+        if (numCircles >= COLOR_CIRCLES.size())
+          return COLOR_CIRCLES.at(index);
+        if (numCircles == 1)
+          return COLOR_CIRCLES.at(0);
+
+        const usize span = COLOR_CIRCLES.size() - 1;
+
+        return COLOR_CIRCLES.at(((index * span) + ((numCircles - 1) / 2)) / (numCircles - 1));
+      };
+
       const usize
         circleWidth       = GetVisualWidth(COLOR_CIRCLES.at(0)),
-        numCircles        = COLOR_CIRCLES.size(),
-        minSpacingPerGap  = 1,
-        totalMinSpacing   = (numCircles - 1) * minSpacingPerGap,
         totalCirclesWidth = numCircles * circleWidth,
-        requiredWidth     = totalCirclesWidth + totalMinSpacing,
-        effectiveWidth    = std::max(availableWidth, requiredWidth);
+        // One column between swatches is preferred, but they are allowed to sit
+        // flush against each other rather than overflow a narrow box.
+        totalMinSpacing = availableWidth >= totalCirclesWidth + (numCircles - 1) ? (numCircles - 1) : 0,
+        requiredWidth   = totalCirclesWidth + totalMinSpacing,
+        effectiveWidth  = std::max(availableWidth, requiredWidth);
 
       if (numCircles == 1) {
         const usize padding = effectiveWidth / 2;
@@ -948,17 +1218,19 @@ namespace draconis::ui {
       }
 
       const usize
-        totalSpacing   = effectiveWidth - totalCirclesWidth,
-        spacingBetween = totalSpacing / (numCircles - 1);
+        gaps         = numCircles - 1,
+        totalSpacing = effectiveWidth - totalCirclesWidth;
 
       String result;
       result.reserve(effectiveWidth);
 
       for (usize i = 0; i < numCircles; ++i) {
+        // Spacing is derived from running totals rather than a fixed step, so
+        // the row spans the full width with the rounding spread across gaps.
         if (i > 0)
-          result.append(spacingBetween, ' ');
+          result.append(((i * totalSpacing) / gaps) - (((i - 1) * totalSpacing) / gaps), ' ');
 
-        const auto& circle = COLOR_CIRCLES.at(i);
+        const StringView circle = circleAt(i);
         result.append(circle.data(), circle.size());
       }
 
@@ -986,6 +1258,8 @@ namespace draconis::ui {
 
         const usize iconW  = GetVisualWidth(row.icon);
         const usize valueW = GetVisualWidth(row.value);
+
+        group.maxIconWidth = std::max(group.maxIconWidth, iconW);
 
         group.iconWidths.push_back(iconW);
         group.labelWidths.push_back(labelWidth);
@@ -1026,6 +1300,15 @@ namespace draconis::ui {
       return groupMaxWidth;
     }
 
+    // Narrowest content width at which this group is still readable: every icon
+    // and label intact, with a sliver left over for the (wrapped) value.
+    constexpr auto GroupMinContentWidth(const UIGroup& group) -> usize {
+      if (group.rows.empty())
+        return 0;
+
+      return group.maxIconWidth + group.maxLabelWidth + 1 + MIN_VALUE_WIDTH;
+    }
+
     constexpr auto RenderGroup(String& out, const UIGroup& group, const usize maxContentWidth, const String& hBorder, bool& hasRenderedContent) {
       if (group.rows.empty())
         return;
@@ -1040,10 +1323,13 @@ namespace draconis::ui {
         const usize    leftWidth  = group.iconWidths.at(i) + group.maxLabelWidth;
         const LogColor valueColor = group.valueColors.at(i);
 
-        // Handle word wrapping if enabled for this row
-        if (group.autoWraps.at(i)) {
+        // Wrap when the row asks for it, and also whenever the value would
+        // otherwise spill past a box that has been squeezed to fit the terminal.
+        const bool overflows = leftWidth + 1 + group.valueWidths.at(i) > maxContentWidth;
+
+        if (group.autoWraps.at(i) || overflows) {
           // Leave at least 1 space between label and value
-          const usize       availableWidth = maxContentWidth - leftWidth - 1;
+          const usize       availableWidth = maxContentWidth > leftWidth + 1 ? maxContentWidth - leftWidth - 1 : 1;
           const Vec<String> wrappedLines   = WordWrap(group.rows.at(i).value, availableWidth);
 
           if (!wrappedLines.empty()) {
@@ -1351,9 +1637,120 @@ namespace draconis::ui {
       return row;
     }
 
+    /**
+     * @brief Draws the bordered info box at an exact content width.
+     * @param groups Pre-measured layout groups.
+     * @param greetingLine Uncolored greeting text.
+     * @param paletteIcon Icon that precedes the color swatches.
+     * @param maxContentWidth Width available between the borders.
+     */
+    auto RenderBox(const Vec<UIGroup>& groups, const String& greetingLine, const StringView paletteIcon, const usize maxContentWidth) -> String {
+      String out;
+
+      usize estimatedLines = 4;
+
+      for (const UIGroup& grp : groups)
+        estimatedLines += grp.rows.empty() ? 0 : (grp.rows.size() + 1);
+
+      out.reserve(estimatedLines * (maxContentWidth + BOX_CHROME_WIDTH + 1));
+
+      const usize innerWidth = maxContentWidth + 1;
+
+      String hBorder;
+      hBorder.reserve(innerWidth * 3);
+      for (usize i = 0; i < innerWidth; ++i) hBorder += "─";
+
+      const auto createLine = [&](const String& left, const String& right = "") -> void {
+        const usize leftWidth  = GetVisualWidth(left);
+        const usize rightWidth = GetVisualWidth(right);
+        const usize padding    = (maxContentWidth >= leftWidth + rightWidth) ? maxContentWidth - (leftWidth + rightWidth) : 0;
+
+        out += "│";
+        out += left;
+        out.append(padding, ' ');
+        out += right;
+        out += " │\n";
+      };
+
+      const auto createLeftAlignedLine =
+        [&](const String& content) -> void { createLine(content, ""); };
+
+      // Top border and greeting
+      out += "╭";
+      out += hBorder;
+      out += "╮\n";
+
+      createLeftAlignedLine(Stylize(TruncateToWidth(greetingLine, maxContentWidth), { .color = DEFAULT_THEME.icon }));
+
+      // Palette line
+      out += "├";
+      out += hBorder;
+      out += "┤\n";
+
+      const String fittedPaletteIcon = TruncateToWidth(paletteIcon, maxContentWidth);
+      const String coloredIcon       = Stylize(fittedPaletteIcon, { .color = DEFAULT_THEME.icon });
+      const usize  availableWidth    = maxContentWidth - GetVisualWidth(fittedPaletteIcon);
+
+      createLeftAlignedLine(coloredIcon + CreateDistributedColorCircles(availableWidth));
+
+      bool hasRenderedContent = true;
+
+      for (const UIGroup& group : groups)
+        RenderGroup(out, group, maxContentWidth, hBorder, hasRenderedContent);
+
+      out += "╰";
+      out += hBorder;
+      out += "╯\n";
+
+      return out;
+    }
+
+    /**
+     * @brief Borderless fallback for terminals too narrow to hold the box.
+     *
+     * Each row becomes an icon/label line followed by its value wrapped and
+     * indented beneath it, so nothing is lost and nothing overflows.
+     */
+    auto RenderPlainList(const Vec<UIGroup>& groups, const String& greetingLine, const StringView paletteIcon, const usize width) -> String {
+      constexpr usize valueIndent = 2;
+
+      String out;
+
+      out += Stylize(TruncateToWidth(greetingLine, width), { .color = DEFAULT_THEME.icon });
+      out += "\n";
+
+      const String fittedPaletteIcon = TruncateToWidth(paletteIcon, width);
+      const usize  paletteRoom       = width - GetVisualWidth(fittedPaletteIcon);
+
+      if (FittingCircleCount(paletteRoom) > 0) {
+        out += Stylize(fittedPaletteIcon, { .color = DEFAULT_THEME.icon });
+        out += CreateDistributedColorCircles(paletteRoom);
+        out += "\n";
+      }
+
+      const usize valueWidth = width > valueIndent ? width - valueIndent : 1;
+
+      for (const UIGroup& group : groups)
+        for (usize i = 0; i < group.rows.size(); ++i) {
+          const RowInfo& row = group.rows.at(i);
+
+          out += Stylize(TruncateToWidth(row.icon, width), { .color = DEFAULT_THEME.icon });
+          out += Stylize(TruncateToWidth(row.label, width - std::min(width, group.iconWidths.at(i))), { .color = DEFAULT_THEME.label });
+          out += "\n";
+
+          for (const String& line : WordWrap(row.value, valueWidth)) {
+            out.append(valueIndent, ' ');
+            out += Stylize(line, { .color = group.valueColors.at(i) });
+            out += "\n";
+          }
+        }
+
+      return out;
+    }
+
   } // namespace
 
-  auto CreateUI(const Config& config, const SystemInfo& data, bool noAscii) -> String {
+  auto CreateUI(const Config& config, const SystemInfo& data, bool noAscii, Option<usize> widthOverride) -> String {
     const String& name     = config.general.getName();
     const Icons&  iconType = ICON_TYPE;
 
@@ -1386,90 +1783,70 @@ namespace draconis::ui {
       groups.push_back(std::move(group));
     }
 
-    usize maxContentWidth = 0;
+    usize naturalContentWidth = 0;
+    usize minContentWidth     = 0;
 
     for (UIGroup& group : groups) {
       if (group.rows.empty())
         continue;
 
-      maxContentWidth = std::max(maxContentWidth, ProcessGroup(group));
+      naturalContentWidth = std::max(naturalContentWidth, ProcessGroup(group));
+      minContentWidth     = std::max(minContentWidth, GroupMinContentWidth(group));
     }
 
     const String greetingLine = std::format("{}{}", iconType.user, _format_f("hello", name));
-    maxContentWidth           = std::max(maxContentWidth, GetVisualWidth(greetingLine));
+    naturalContentWidth       = std::max(naturalContentWidth, GetVisualWidth(greetingLine));
 
     // Calculate width needed for color circles (including minimum spacing)
+    const usize paletteIconWidth  = GetVisualWidth(iconType.palette);
     const usize circleWidth       = GetVisualWidth(COLOR_CIRCLES.at(0));
     const usize totalCirclesWidth = COLOR_CIRCLES.size() * circleWidth;
     const usize minSpacingPerGap  = 1;
     const usize totalMinSpacing   = (COLOR_CIRCLES.size() - 1) * minSpacingPerGap;
-    const usize colorCirclesWidth = GetVisualWidth(iconType.palette) + totalCirclesWidth + totalMinSpacing;
-    maxContentWidth               = std::max(maxContentWidth, colorCirclesWidth);
+    const usize colorCirclesWidth = paletteIconWidth + totalCirclesWidth + totalMinSpacing;
+    naturalContentWidth           = std::max(naturalContentWidth, colorCirclesWidth);
 
-    String out;
+    // The palette can shed swatches, but the icon plus one swatch is the floor.
+    minContentWidth = std::max(minContentWidth, paletteIconWidth + circleWidth);
+    minContentWidth = std::min(minContentWidth, naturalContentWidth);
 
-    usize estimatedLines = 4;
+    TerminalSize terminal {};
 
-    for (const UIGroup& grp : groups)
-      estimatedLines += grp.rows.empty() ? 0 : (grp.rows.size() + 1);
+    if (config.ui.responsive)
+      terminal = ResolveTerminalSize(widthOverride);
+    else if (widthOverride)
+      // An explicit width still applies when responsive layout is switched off,
+      // so `--width` remains usable for scripted or reproducible output.
+      terminal.columns = *widthOverride;
 
-    out.reserve(estimatedLines * (maxContentWidth + 4));
+    const usize budget = terminal.columns;
 
-    const usize innerWidth = maxContentWidth + 1;
+    // Below the floor there is no box worth drawing; fall back to a plain list.
+    if (budget > 0 && budget < minContentWidth + BOX_CHROME_WIDTH)
+      return RenderPlainList(groups, greetingLine, iconType.palette, budget);
 
-    String hBorder;
-    hBorder.reserve(innerWidth * 3);
-    for (usize i = 0; i < innerWidth; ++i) hBorder += "─";
+    usize maxContentWidth = naturalContentWidth;
 
-    const auto createLine = [&](const String& left, const String& right = "") -> void {
-      const usize leftWidth  = GetVisualWidth(left);
-      const usize rightWidth = GetVisualWidth(right);
-      const usize padding    = (maxContentWidth >= leftWidth + rightWidth) ? maxContentWidth - (leftWidth + rightWidth) : 0;
+    if (budget > 0)
+      maxContentWidth = std::min(maxContentWidth, budget - BOX_CHROME_WIDTH);
 
-      out += "│";
-      out += left;
-      out.append(padding, ' ');
-      out += right;
-      out += " │\n";
+    String out = RenderBox(groups, greetingLine, iconType.palette, maxContentWidth);
+
+    const auto splitLines = [](const String& text) -> Vec<String> {
+      Vec<String>       result;
+      std::stringstream stream(text);
+      String            line;
+
+      while (std::getline(stream, line, '\n'))
+        result.push_back(line);
+
+      if (!result.empty() && result.back().empty())
+        result.pop_back();
+
+      return result;
     };
 
-    const auto createLeftAlignedLine =
-      [&](const String& content) -> void { createLine(content, ""); };
-
-    // Top border and greeting
-    out += "╭";
-    out += hBorder;
-    out += "╮\n";
-
-    createLeftAlignedLine(Stylize(greetingLine, { .color = DEFAULT_THEME.icon }));
-
-    // Palette line
-    out += "├";
-    out += hBorder;
-    out += "┤\n";
-
-    const String paletteIcon    = Stylize(iconType.palette, { .color = DEFAULT_THEME.icon });
-    const usize  availableWidth = maxContentWidth - GetVisualWidth(paletteIcon);
-    createLeftAlignedLine(paletteIcon + CreateDistributedColorCircles(availableWidth));
-
-    bool hasRenderedContent = true;
-
-    for (const UIGroup& group : groups)
-      RenderGroup(out, group, maxContentWidth, hBorder, hasRenderedContent);
-
-    out += "╰";
-    out += hBorder;
-    out += "╯\n";
-
-    Vec<String>       boxLines;
-    std::stringstream stream(out);
-    String            line;
-
-    while (std::getline(stream, line, '\n'))
-      boxLines.push_back(line);
-
-    if (!boxLines.empty() && boxLines.back().empty())
-      boxLines.pop_back();
+    const Vec<String> boxLines = splitLines(out);
 
     const usize  boxWidth = GetVisualWidth(boxLines.at(0));
     const String emptyBox = "│" + String(boxWidth - 2, ' ') + "│";
@@ -1509,6 +1886,31 @@ namespace draconis::ui {
 
     if (!isInlineLogo && logoLines.empty())
       return out;
+
+    // The box is sized from the terminal alone, so the logo is what gives way
+    // when the two cannot share the row. Narrowing the box to keep the logo
+    // would only widen it again a column later, which reads worse at every step
+    // in between.
+    {
+      const usize logoRows = isInlineLogo ? (logoHeightOpt != 0 ? logoHeightOpt : boxLines.size()) : logoLines.size();
+
+      const bool tooWide = budget > 0 && maxLogoW + LOGO_GUTTER_WIDTH + boxWidth > budget;
+      const bool tooTall = terminal.rows > 0 && logoRows > terminal.rows && boxLines.size() <= terminal.rows;
+
+      // The box on its own was already rendered inside the width budget.
+      if (tooWide || tooTall) {
+        debug_log(
+          "Hiding logo: it needs {}x{} beside a {}-wide box, but the terminal is {}x{}",
+          maxLogoW,
+          logoRows,
+          boxWidth,
+          budget,
+          terminal.rows
+        );
+
+        return out;
+      }
+    }
 
     const usize  logoHeight = isInlineLogo ? (logoHeightOpt ? logoHeightOpt : boxLines.size()) : logoLines.size();
     const String emptyLogo(maxLogoW, ' ');

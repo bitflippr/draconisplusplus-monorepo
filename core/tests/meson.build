@@ -89,6 +89,15 @@ foreach plugin_root : get_option('plugin_dirs')
   endif
 endforeach
 
+# The rendered UI must fit the terminal it is printed into.
+ui_layout = executable('test_ui_layout',
+  ['test_ui_layout.cpp', '../src/CLI/Core/SystemInfo.cpp', '../src/CLI/UI/UI.cpp'],
+  include_directories: include_directories('../src/CLI'),
+  dependencies: test_deps)
+test('UI Layout', python_prog,
+  args: [meson.project_source_root() / 'tools/run_isolated_test.py', ui_layout.full_path()],
+  depends: ui_layout)
+
 # Selection must not initialize or collect unrelated providers.
 collection_selection = executable('test_collection_selection',
   ['test_collection_selection.cpp', '../src/CLI/Core/SystemInfo.cpp', '../src/CLI/UI/UI.cpp'],

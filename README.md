@@ -86,6 +86,37 @@ use. Builds intended for immutable or declarative systems can instead enable
 `-Dprecompiled_config=true` and provide a `config.hpp` based on
 [`config.example.hpp`](config.example.hpp).
 
+### Terminal size
+
+The default output adapts to the terminal it is printed into. The logo is
+dropped first, as soon as it no longer fits beside the box at full width. Only
+once the box alone is too wide does the box itself narrow, giving up spare
+padding and wrapping long values. Very narrow terminals get a borderless list
+instead of the box. Wide terminals are unaffected.
+
+The box is sized from the terminal alone, never from what the logo leaves over,
+so a narrower terminal never produces a wider box.
+
+The size is read from the terminal on standard output, with `COLUMNS` and
+`LINES` taking precedence when they are exported. Output that is piped or
+redirected is laid out as if the terminal were unlimited, so pass `--width` (or
+export `COLUMNS`) when feeding a pager.
+
+```bash
+draconis++ --width 80   # lay out for 80 columns regardless of the real size
+draconis++ --width 0    # never adapt; always use the natural width
+```
+
+To turn adaptation off permanently, set it in the configuration file:
+
+```toml
+[ui]
+responsive = false
+```
+
+Precompiled-config builds use `#define DRAC_UI_RESPONSIVE false` in `config.hpp`
+instead; leaving it undefined keeps the adaptive layout.
+
 ## Plugins
 
 Plugins live outside this repository. A plugin is a self-contained directory

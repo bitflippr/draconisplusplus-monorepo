@@ -57,6 +57,7 @@ namespace {
     bool   noAscii = false;
     String outputFormat;
     String compactFormat;
+    i32    width = -1; // -1 = detect from the terminal
 
     // Localization
     String language;
@@ -132,6 +133,12 @@ auto main(const i32 argc, CStr* argv[]) -> i32 try {
       .help("Disable ASCII art display.")
       .flag()
       .bindTo(opts.noAscii);
+
+    parser
+      .addArguments("--width")
+      .help("Lay out for this terminal width in columns instead of detecting it. Use 0 to disable width adaptation.")
+      .defaultValue(i32(-1))
+      .bindTo(opts.width);
 
     parser
       .addArguments("--format")
@@ -346,7 +353,12 @@ auto main(const i32 argc, CStr* argv[]) -> i32 try {
     } else if (!opts.compactFormat.empty()) {
       PrintCompactOutput(opts.compactFormat, data);
     } else {
-      Print(CreateUI(config, data, opts.noAscii));
+      Print(CreateUI(
+        config,
+        data,
+        opts.noAscii,
+        opts.width < 0 ? None : Option<usize>(static_cast<usize>(opts.width))
+      ));
     }
   }
 

@@ -21,6 +21,11 @@ namespace fs = std::filesystem;
   #endif
 
   #include "../../../config.hpp" // user-defined config
+
+  // Kept optional so a config.hpp predating this setting still compiles.
+  #ifndef DRAC_UI_RESPONSIVE
+    #define DRAC_UI_RESPONSIVE true
+  #endif
 #endif
 
 #if !DRAC_PRECOMPILED_CONFIG
@@ -68,6 +73,7 @@ namespace {
 
   struct TomlUI {
     Vec<TomlLayoutGroup> layout;
+    bool                 responsive = true;
   };
 
   struct TomlConfig {
@@ -125,7 +131,7 @@ struct glz::meta<TomlLayoutGroup> {
 template <>
 struct glz::meta<TomlUI> {
   using T                     = TomlUI;
-  static constexpr auto value = object("layout", &T::layout);
+  static constexpr auto value = object("layout", &T::layout, "responsive", &T::responsive);
 };
 
 template <>
@@ -289,6 +295,8 @@ namespace draconis::config {
     cfg.plugins.enabled = true;
   #endif
 
+    cfg.ui.responsive = DRAC_UI_RESPONSIVE;
+
     PopulatePrecompiledLayout(cfg);
 
     // Logo settings from precompiled config
@@ -424,6 +432,7 @@ namespace draconis::config {
   #endif
 
       // UI layout settings
+      cfg.ui.responsive = tomlCfg.ui.responsive;
       cfg.ui.layout.clear();
       for (const TomlLayoutGroup& group : tomlCfg.ui.layout) {
         UILayoutGroup cfgGroup;
