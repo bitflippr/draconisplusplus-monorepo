@@ -5,37 +5,49 @@
   ...
 }: let
   llvmPackages = pkgs.llvmPackages_20;
+  isLinux = pkgs.stdenv.hostPlatform.isLinux;
 
-  stdenv = with pkgs;
-    (
-      if pkgs.stdenv.hostPlatform.isLinux
-      then stdenvAdapters.useMoldLinker
-      else lib.id
-    )
-    llvmPackages.stdenv;
+  # Use libc++ on Linux too, so the standard library comes from the pinned LLVM
+  # rather than whichever GCC nixpkgs defaults to. Darwin's stdenv already does.
+  stdenv =
+    if isLinux
+    then pkgs.stdenvAdapters.useMoldLinker llvmPackages.libcxxStdenv
+    else llvmPackages.stdenv;
+
+  # Compiled C++ dependencies must share the binary's standard library.
+  withLibcxx = pkg: args: pkg.override ({stdenv = llvmPackages.libcxxStdenv;} // args);
+
+  sqlitecpp =
+    if isLinux
+    then
+      (withLibcxx pkgs.sqlitecpp {inherit (pkgs.pkgsStatic) sqlite;}).overrideAttrs (old: {
+        doCheck = false;
+        cmakeFlags = old.cmakeFlags ++ ["-DSQLITECPP_BUILD_TESTS=OFF" "-DBUILD_SHARED_LIBS=OFF"];
+      })
+    else pkgs.pkgsStatic.sqlitecpp;
 
   boostUt = pkgs.callPackage ./boost-ut.nix {};
 
   deps = with pkgs;
     [
       (glaze.overrideAttrs rec {
-        version = "6.1.0";
+        version = "9.0.0";
 
         src = pkgs.fetchFromGitHub {
           owner = "stephenberry";
           repo = "glaze";
           tag = "v${version}";
-          hash = "sha256-H1paMc0LH743aMHCO/Ocp96SaaoXLcl/MDmmbtSJG+Q=";
+          hash = "sha256-dzvKhaSfaDuJ+yHep+OgC6kTRMW59kOtSDw2KD1drVI=";
         };
       })
       boostUt
+      sqlitecpp
     ]
     ++ (with pkgs.pkgsStatic; [
       (magic-enum.overrideAttrs (old: {
         doCheck = false;
         cmakeFlags = (old.cmakeFlags or []) ++ ["-DMAGIC_ENUM_OPT_BUILD_TESTS=OFF"];
       }))
-      sqlitecpp
       boostUt
     ])
     ++ darwinPkgs
@@ -53,9 +65,9 @@
   linuxPkgs = lib.optionals stdenv.isLinux (with pkgs;
     [
       valgrind
+      (withLibcxx pugixml {})
     ]
     ++ (with pkgsStatic; [
-      pugixml
       libxcb
       wayland
     ]));

@@ -16,13 +16,13 @@
     llvmPackages.libcxxStdenv;
 
   glaze = (muslPkgs.glaze.override {inherit stdenv;}).overrideAttrs (oldAttrs: rec {
-    version = "6.1.0";
+    version = "9.0.0";
 
     src = pkgs.fetchFromGitHub {
       owner = "stephenberry";
       repo = "glaze";
       tag = "v${version}";
-      hash = "sha256-H1paMc0LH743aMHCO/Ocp96SaaoXLcl/MDmmbtSJG+Q=";
+      hash = "sha256-dzvKhaSfaDuJ+yHep+OgC6kTRMW59kOtSDw2KD1drVI=";
     };
 
     cmakeFlags =
