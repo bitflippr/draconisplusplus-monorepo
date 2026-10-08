@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Cross-platform system information library"
 license = "MIT"
-repository = "https://github.com/skulldogged/draconisplusplus"
+repository = "https://github.com/bitflippr/draconisplusplus"
 keywords = ["system", "info", "hardware", "cross-platform"]
 categories = ["os", "hardware-support", "api-bindings"]
 
